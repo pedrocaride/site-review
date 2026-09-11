@@ -5,7 +5,6 @@ from typing import Any, Dict
 
 import folium
 from folium.plugins import Draw
-import pandas as pd
 import shapely.geometry
 import shapely.wkt
 import streamlit as st
@@ -13,10 +12,14 @@ from streamlit_folium import st_folium
 
 
 from services import (
+    fetch_epa_hazards,
     fetch_fema_flood_hazard,
     fetch_noaa_precipitation,
+    fetch_parcels,
     fetch_usda_soil_report,
     fetch_usgs_topography,
+    fetch_utilities,
+    fetch_wetlands,
     generate_50pct_buffer,
     identify_jurisdiction,
 )
@@ -33,7 +36,6 @@ st.set_page_config(
 )
 
 
-# Increase padding-top to 3.8rem to prevent Streamlit top navigation bar from clipping the logo
 st.markdown(
     """
     <meta name="robots" content="noindex, nofollow">
@@ -41,10 +43,6 @@ st.markdown(
         .block-container { 
             padding-top: 3.8rem !important; 
             padding-bottom: 2rem; 
-        }
-        .logo-wrapper {
-            margin-top: 0.6rem;
-            display: inline-block;
         }
     </style>
     """,
@@ -73,13 +71,12 @@ logo_file = next((f for f in logo_candidates if os.path.exists(f)), None)
 if logo_file:
     col_l, col_t = st.columns([1, 3])
     with col_l:
-        st.write("")  # Clean vertical spacing
+        st.write("")
         st.image(logo_file, width=250)
     with col_t:
         st.title("Land Development Site Due Diligence")
-        st.caption("Automated preliminary civil engineering due diligence: NOAA Precipitation, USGS Topography, USDA Soil Survey, FEMA Flood Hazard, and Local Jurisdictions.")
+        st.caption("Automated preliminary civil engineering due diligence: NOAA Precipitation, USGS Topography, USDA Soil Survey, FEMA Flood Hazard, Environmental Wetlands & Hazards, and Cadastral GIS (50 US States).")
 else:
-    # Built-in Civilocity vector branding banner (safely padded)
     st.markdown(
         """
         <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 20px; margin-top: 0.5rem; margin-bottom: 0.8rem; padding-bottom: 0.8rem; border-bottom: 1px solid #e2e8f0;">
@@ -104,26 +101,39 @@ st.write("")
 
 
 # -----------------------------------------------------------------------------
-# ASYNCHRONOUS ENGINE DISPATCH (5 MODULES)
+# ASYNCHRONOUS ENGINE DISPATCH (9 CONCURRENT MODULES)
 # -----------------------------------------------------------------------------
 def execute_due_diligence(
     site_wgs84: shapely.geometry.base.BaseGeometry,
     buffered_wgs84: shapely.geometry.base.BaseGeometry,
     lat: float,
     lon: float,
+    custom_parcel_url: str = None,
+    custom_util_url: str = None,
 ) -> Dict[str, Any]:
     wkt_poly = shapely.wkt.dumps(site_wgs84)
+
+
+    jur_data = identify_jurisdiction(lat, lon)
+    county_name = jur_data.get("county", "County")
+    city_name = jur_data.get("city", "Unincorporated")
+    state_name = jur_data.get("state", "State")
+
+
     tasks = {
         "noaa": (fetch_noaa_precipitation, (lat, lon)),
         "usgs": (fetch_usgs_topography, (buffered_wgs84,)),
         "usda": (fetch_usda_soil_report, (wkt_poly, site_wgs84)),
         "fema": (fetch_fema_flood_hazard, (site_wgs84, buffered_wgs84)),
-        "jurisdiction": (identify_jurisdiction, (lat, lon)),
+        "wetlands": (fetch_wetlands, (site_wgs84,)),
+        "epa": (fetch_epa_hazards, (site_wgs84, buffered_wgs84)),
+        "parcels": (fetch_parcels, (site_wgs84, county_name, state_name, custom_parcel_url)),
+        "utilities": (fetch_utilities, (site_wgs84, city_name, county_name, state_name, custom_util_url)),
     }
 
 
-    results = {}
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    results = {"jurisdiction": jur_data}
+    with ThreadPoolExecutor(max_workers=9) as executor:
         futures = {k: executor.submit(fn, *args) for k, (fn, args) in tasks.items()}
         for k, fut in futures.items():
             try:
@@ -139,13 +149,22 @@ def execute_due_diligence(
 
 
 # -----------------------------------------------------------------------------
-# CARTOGRAPHIC VIEWER & DRAW CONTROLS
+# CARTOGRAPHIC VIEWER & DRAW CONTROLS (NATIONWIDE DEFAULT & LOCK-ON RECTANGLE)
 # -----------------------------------------------------------------------------
 col_map, col_ctrl = st.columns([7, 3])
 
 
+# Dynamic Map centering: Nationwide USA by default, locks onto site once drawn
+if "centroid" in st.session_state:
+    map_center = st.session_state["centroid"]
+    map_zoom = 15
+else:
+    map_center = [39.8283, -98.5795]  # Geographic center of the Continental US
+    map_zoom = 4
+
+
 with col_map:
-    m = folium.Map(location=[28.5383, -81.3792], zoom_start=14, tiles=None, control_scale=True)
+    m = folium.Map(location=map_center, zoom_start=map_zoom, tiles=None, control_scale=True)
 
 
     folium.TileLayer(
@@ -179,6 +198,7 @@ with col_map:
     ).add_to(m)
 
 
+    # Active Project Boundaries
     if "site_geom" in st.session_state and "buffered_geom" in st.session_state:
         folium.GeoJson(
             shapely.geometry.mapping(st.session_state["buffered_geom"]),
@@ -188,7 +208,7 @@ with col_map:
                 "weight": 2,
                 "dashArray": "5, 5",
                 "fillColor": "#ff9800",
-                "fillOpacity": 0.15,
+                "fillOpacity": 0.12,
             },
         ).add_to(m)
 
@@ -198,15 +218,82 @@ with col_map:
             name="Site Boundary",
             style_function=lambda x: {
                 "color": "#0091ea",
-                "weight": 3,
+                "weight": 3.5,
                 "fillColor": "#00b0ff",
-                "fillOpacity": 0.25,
+                "fillOpacity": 0.20,
             },
         ).add_to(m)
 
 
+        # Locks the map strictly onto the drawn rectangle and prevents returning to default
+        minx, miny, maxx, maxy = st.session_state["site_geom"].bounds
+        m.fit_bounds([[miny, minx], [maxy, maxx]])
+
+
+    # Render Retrieved Vector Layers (ArcGIS REST)
+    if "analysis_results" in st.session_state:
+        res_data = st.session_state["analysis_results"]
+
+
+        # 1. USFWS Wetlands Layer (Cyan)
+        wetlands_res = res_data.get("wetlands", {})
+        if wetlands_res.get("geojson"):
+            folium.GeoJson(
+                wetlands_res["geojson"],
+                name="🌱 USFWS Wetlands (NWI)",
+                style_function=lambda x: {
+                    "color": "#00e5ff",
+                    "weight": 2.5,
+                    "fillColor": "#00e5ff",
+                    "fillOpacity": 0.40,
+                },
+                tooltip=folium.GeoJsonTooltip(
+                    fields=["WETLAND_TYPE", "ATTRIBUTE", "ACRES"],
+                    aliases=["Type:", "Code:", "Acres:"],
+                ),
+            ).add_to(m)
+
+
+        # 2. EPA Hazard Sites Layer (Red)
+        epa_res = res_data.get("epa", {})
+        if epa_res.get("geojson"):
+            folium.GeoJson(
+                epa_res["geojson"],
+                name="⚠️ EPA Environmental Hazards",
+                style_function=lambda x: {
+                    "color": "#e63946",
+                    "weight": 2.5,
+                    "fillColor": "#e63946",
+                    "fillOpacity": 0.50,
+                },
+                tooltip=folium.GeoJsonTooltip(
+                    fields=["NAME", "STATUS", "TYPE"],
+                    aliases=["Site Name:", "Status:", "Category:"],
+                ),
+            ).add_to(m)
+
+
+        # 3. Parcels Layer (Purple)
+        parcels_res = res_data.get("parcels", {})
+        if parcels_res.get("geojson"):
+            folium.GeoJson(
+                parcels_res["geojson"],
+                name="🏛️ Cadastral Parcels",
+                style_function=lambda x: {
+                    "color": "#9d4edd",
+                    "weight": 2.5,
+                    "fillColor": "#9d4edd",
+                    "fillOpacity": 0.20,
+                },
+                tooltip=folium.GeoJsonTooltip(
+                    fields=["PARCEL_ID", "ZONING", "LAND_USE"],
+                    aliases=["Parcel ID:", "Zoning:", "Land Use:"],
+                ),
+            ).add_to(m)
+
+
     folium.LayerControl(position="topright").add_to(m)
-    map_data = st_folium(m, height=480, width="100%", returned_objects=["last_active_drawing"])
+    map_data = st_folium(m, height=520, width="100%", returned_objects=["last_active_drawing"])
 
 
 active_drawing = map_data.get("last_active_drawing") if map_data else None
@@ -230,27 +317,36 @@ with col_ctrl:
     if "site_geom" in st.session_state:
         lat, lon = st.session_state["centroid"]
         site_m2 = st.session_state["site_geom"].area * 1e6
+        site_acres = site_m2 / 4046.8564224
         buffer_dist_ft = st.session_state.get("buffer_dist_m", 30.0) * 3.28084
         topo_m2 = site_m2 * 1.50
 
 
         st.markdown(f"**Centroid:** `{lat:.6f}°, {lon:.6f}°`")
-        st.markdown(f"**Site Area:** `{site_m2:.1f} m²`")
+        st.markdown(f"**Site Area:** `{site_m2:.1f} m²` *({site_acres:.2f} Acres)*")
         st.markdown(f"**Topography Study Area:** `{topo_m2:.1f} m²` *(+50% Area / ~{buffer_dist_ft:.1f} ft offset)*")
 
 
+        with st.expander("⚙️ Optional Local GIS Endpoints", expanded=False):
+            st.caption("Auto-queries nationwide BLM/FDOR Cadastre by default. Enter custom ArcGIS REST FeatureServer URLs for municipal utilities or parcels if available:")
+            custom_parcel_endpoint = st.text_input("Local Parcel FeatureServer URL", placeholder="https://.../FeatureServer/0", key="cfg_parcel")
+            custom_util_endpoint = st.text_input("Local Utility FeatureServer URL", placeholder="https://.../FeatureServer/0", key="cfg_util")
+
+
         if st.button("🚀 Run Site Analysis", type="primary", use_container_width=True):
-            with st.spinner("Executing NOAA, USGS, USDA, FEMA, and Census services in parallel..."):
+            with st.spinner("Executing NOAA, USGS, USDA, FEMA, Wetlands, EPA, Cadastre, and Utility services concurrently..."):
                 results = execute_due_diligence(
                     st.session_state["site_geom"],
                     st.session_state["buffered_geom"],
                     lat,
                     lon,
+                    custom_parcel_url=custom_parcel_endpoint,
+                    custom_util_url=custom_util_endpoint,
                 )
                 st.session_state["analysis_results"] = results
                 st.rerun()
     else:
-        st.info("Use the polygon tool on the upper-left of the map to draw the project boundary.")
+        st.info("Use the polygon or rectangle tool on the upper-left of the map to draw the project boundary anywhere in the United States.")
 
 
 # -----------------------------------------------------------------------------
@@ -293,7 +389,7 @@ if "analysis_results" in st.session_state:
                 st.warning(f"⚠️ {noaa.get('message')}")
 
 
-    # 2. USGS 3DEP TOPOGRAPHY (CON BUFFER +50% ÁREA)
+    # 2. USGS 3DEP TOPOGRAPHY (+50% AREA)
     with col_r2:
         with st.container(border=True):
             st.markdown("#### 2. Site Topography (USGS 3DEP DEM)")
@@ -320,50 +416,21 @@ if "analysis_results" in st.session_state:
                 st.warning(f"⚠️ {usgs.get('message')}")
 
 
-    # 3. USDA WEB SOIL SURVEY (MAP UNIT LEGEND TABLE IN APP - MAP IN PDF ONLY)
-    with st.container(border=True):
-        st.markdown("#### 3. Soil Resource Report (USDA NRCS SSURGO)")
-        usda = res.get("usda", {})
-        if usda.get("status") == "success":
-            st.markdown("##### Map Unit Legend")
-            units = usda.get("map_units", [])
-            if units:
-                table_display = []
-                for u in units:
-                    table_display.append({
-                        "Symbol": u.get("musym"),
-                        "Map Unit Name": u.get("muname"),
-                        "Acres in AOI": f"{u.get('acres', 0.0):.1f}",
-                        "Percent of AOI": u.get("percent", "0.0%"),
-                        "HSG": u.get("hsg", "Not Rated"),
-                        "Water Table (SHWT)": u.get("water_table", "N/A"),
-                    })
-                df_soils = pd.DataFrame(table_display)
-                st.dataframe(df_soils, hide_index=True, use_container_width=True)
-                st.caption(f"**Totals for Area of Interest:** `{usda.get('total_acres', 0.0):.1f} Acres (100.0%)`")
+    col_r3, col_r4 = st.columns(2)
 
 
-            c1, c2 = st.columns(2)
-            with c1:
-                st.download_button(
-                    label="📥 Download Soil Report & Map (PDF)",
-                    data=usda["pdf_bytes"],
-                    file_name=usda["filename"],
-                    mime="application/pdf",
-                    key="dl_usda",
-                    use_container_width=True,
-                )
-            with c2:
-                st.link_button(
-                    "🌐 Open WSS (AOI Ready)",
-                    usda.get("wss_url", "https://websoilsurvey.nrcs.usda.gov/app/WebSoilSurvey.aspx"),
-                    use_container_width=True,
-                )
-        else:
-            st.warning(f"⚠️ {usda.get('message')}")
-
-
-    col_r4, col_r5 = st.columns(2)
+    # 3. USDA WEB SOIL SURVEY (ONLY DIRECT AOI LINK — NO PDF, NO TABLE)
+    with col_r3:
+        with st.container(border=True):
+            st.markdown("#### 3. Soil Survey (USDA NRCS)")
+            usda = res.get("usda", {})
+            st.write("Open official USDA Web Soil Survey with your exact project boundary pre-delineated as the Area of Interest (AOI) to generate official regulatory soil reports.")
+            st.link_button(
+                "🌐 Open USDA Web Soil Survey (AOI Ready)",
+                usda.get("wss_url", "https://websoilsurvey.nrcs.usda.gov/app/WebSoilSurvey.aspx"),
+                type="primary",
+                use_container_width=True,
+            )
 
 
     # 4. FEMA NFHL FLOOD HAZARDS
@@ -393,6 +460,9 @@ if "analysis_results" in st.session_state:
                 st.warning(f"⚠️ {fema.get('message')}")
 
 
+    col_r5, col_r6 = st.columns(2)
+
+
     # 5. LOCAL JURISDICTION & STANDARDS
     with col_r5:
         with st.container(border=True):
@@ -403,15 +473,96 @@ if "analysis_results" in st.session_state:
                 b1, b2 = st.columns(2)
                 with b1:
                     st.link_button(
-                        "📘 Stormwater Manual",
+                        "📘 State Stormwater Manual (ERP/NPDES)",
                         jur.get("stormwater_manual_url"),
                         use_container_width=True,
                     )
                 with b2:
                     st.link_button(
-                        "🏛️ Municode / LDR",
+                        "🏛️ Municode State Code Library",
                         jur.get("municode_ldr_url"),
                         use_container_width=True,
                     )
             else:
                 st.warning(f"⚠️ {jur.get('message')}")
+
+
+    # 6. USFWS NATIONAL WETLANDS INVENTORY
+    with col_r6:
+        with st.container(border=True):
+            st.markdown("#### 6. Environmental Wetlands (USFWS NWI)")
+            wetlands = res.get("wetlands", {})
+            if wetlands.get("status") == "success":
+                st.write(f"**NWI Wetlands:** `{wetlands.get('summary')}`")
+                st.caption(f"**Coordinates:** `{wetlands.get('coords_str', '')}`")
+                if wetlands.get("count", 0) > 0:
+                    st.info("🌱 Wetland polygons are displayed in cyan on the interactive map above.")
+                st.link_button(
+                    "🌐 Open USFWS Wetlands Mapper",
+                    wetlands.get("wetlands_url"),
+                    use_container_width=True,
+                )
+            else:
+                st.warning(f"⚠️ {wetlands.get('message')}")
+
+
+    col_r7, col_r8 = st.columns(2)
+
+
+    # 7. EPA ENVIRONMENTAL HAZARDS
+    with col_r7:
+        with st.container(border=True):
+            st.markdown("#### 7. Environmental Hazards (EPA ECHO)")
+            epa = res.get("epa", {})
+            if epa.get("status") == "success":
+                st.write(f"**EPA Hazards:** `{epa.get('summary')}`")
+                st.caption(f"**Search Center:** `{epa.get('coords_str', '')}` *(1-mile radius)*")
+                if epa.get("count", 0) > 0:
+                    st.warning("⚠️ Regulated hazard sites are highlighted in red on the interactive map above.")
+                st.link_button(
+                    "🌐 Open EPA ECHO Facility Search (1-Mile Radius)",
+                    epa.get("echo_url"),
+                    use_container_width=True,
+                )
+            else:
+                st.warning(f"⚠️ {epa.get('message')}")
+
+
+    # 8. PARCEL CADASTRE & PROPERTY RECORDS
+    with col_r8:
+        with st.container(border=True):
+            st.markdown("#### 8. Property Cadastre & Parcel Search")
+            parcels = res.get("parcels", {})
+            if parcels.get("status") == "success":
+                st.write(f"**Cadastral Status:** `{parcels.get('summary')}`")
+                if parcels.get("count", 0) > 0:
+                    st.info("🏛️ Cadastral parcels are delineated in purple on the interactive map above.")
+                b_p1, b_p2 = st.columns(2)
+                with b_p1:
+                    st.link_button(
+                        "🌐 Regrid Parcel Lookup",
+                        parcels.get("regrid_url"),
+                        use_container_width=True,
+                    )
+                with b_p2:
+                    st.link_button(
+                        "🏛️ County Property Appraiser GIS",
+                        parcels.get("pa_url"),
+                        use_container_width=True,
+                    )
+            else:
+                st.warning(f"⚠️ {parcels.get('message')}")
+
+
+    # 9. WATER & WASTEWATER UTILITY INFRASTRUCTURE (DIRECT GOOGLE SEARCH FOR CITY/COUNTY GIS)
+    with st.container(border=True):
+        st.markdown("#### 9. Water & Wastewater Utilities")
+        utils = res.get("utilities", {})
+        entity_name = utils.get("entity_name", "Local Jurisdiction")
+        st.write(f"Search official Water & Wastewater utility maps and public works GIS records for **{entity_name}**.")
+        st.link_button(
+            f"🔍 Search {entity_name} Water & Sewer Utility GIS on Google",
+            utils.get("utility_url"),
+            type="primary",
+            use_container_width=True,
+        )
